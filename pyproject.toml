@@ -5,11 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alibabacloud-oss-v2>=1.4.0",
+    "charset-normalizer>=3.5.1",
+    "fastapi>=0.141.1",
     "langchain>=1.4.0",
     "langchain-deepseek>=1.1.0",
+    "langchain-mcp-adapters>=0.3.2",
     "langchain-openai>=1.6.1",
     "langchain-tavily>=0.2.18",
     "langgraph-checkpoint-postgres>=3.1.2",
+    "langgraph-cli[inmem]>=0.4.31",
     "openai>=3.10.0",
     "psycopg[binary]>=3.3.5",
     "python-dotenv>=1.2.3",
@@ -21,3 +26,8 @@ dependencies = [
 [build-system]
 requires = ["uv_build>=0.12.11,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
