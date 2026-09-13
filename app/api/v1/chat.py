@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessageChunk, HumanMessage
 
+from app.api.deps import get_current_user
+from app.common.llm import should_fallback
+from app.common.logger import logger
+from app.common.preferences import format_user_context
 from app.models.schemas import ChatRequest
 
 router = APIRouter()
@@ -33,34 +37,163 @@ def _content_to_text(content) -> str:
     return ""
 
 
+def _content_to_parts(content):
+    """转成前端能直接用的形式：纯文本，或 [文本, 图片...] 数组。
+
+    只返回文本的话，用户上传的图片在刷新/切换会话后就会消失
+    （前端本来就支持数组形式，是后端把它拍平了）。
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    texts: list[str] = []
+    images: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            texts.append(part.get("text", ""))
+        elif part_type in ("image", "image_url"):
+            url = part.get("url")
+            if not url and isinstance(part.get("image_url"), dict):
+                url = part["image_url"].get("url")
+            if url:
+                images.append(url)
+
+    text = "".join(texts)
+    if not images:
+        return text
+    return [{"type": "text", "text": text}] + [
+        {"type": "image", "url": url} for url in images
+    ]
+
+
+async def _thread_owner(pool, thread_id: str):
+    """这个会话归谁所有？没登记过返回 None。"""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select user_id from app_threads where thread_id = %s", (thread_id,)
+        )
+        row = await cur.fetchone()
+    return row["user_id"] if row else None
+
+
+async def _ensure_thread_owned(pool, thread_id: str, user_id: int) -> None:
+    """确认会话属于当前用户；第一次见到这个 thread_id 时登记归属。"""
+    owner = await _thread_owner(pool, thread_id)
+    if owner is None:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                insert into app_threads (thread_id, user_id) values (%s, %s)
+                on conflict (thread_id) do nothing
+                """,
+                (thread_id, user_id),
+            )
+        owner = await _thread_owner(pool, thread_id)
+
+    if owner != user_id:
+        raise HTTPException(status_code=403, detail="无权访问该会话")
+
+
+async def _load_preferences(pool, user_id: int) -> str:
+    """取当前用户的称呼和菜品偏好，拼成给模型看的说明；都没设置返回空串。"""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            select display_name, taste, spicy_level, diet_goal,
+                   avoid_ingredients, preferred_cuisines, notes
+            from app_users where id = %s
+            """,
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    return format_user_context(row)
+
+
 @router.post("/chat/stream")
-async def chat_stream(payload: ChatRequest, request: Request):
+async def chat_stream(
+    payload: ChatRequest,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     """流式对话：返回纯文本流，前端逐块拼接显示。"""
-    agent = request.app.state.agent
+    await _ensure_thread_owned(request.app.state.pool, payload.thread_id, user["id"])
+    preferences = await _load_preferences(request.app.state.pool, user["id"])
+
+    candidates: list = list(getattr(request.app.state, "agents", []) or [])
+    if not candidates:
+        raise HTTPException(status_code=503, detail="当前没有可用的模型")
     config = {"configurable": {"thread_id": payload.thread_id}}
 
     async def generate():
-        async for chunk, _meta in agent.astream(
-            {"messages": [_to_human_message(payload)]},
-            config,
-            stream_mode="messages",
-        ):
-            # 只转发"模型自己生成的文本增量"。
-            # stream_mode="messages" 会把工具返回（ToolMessage，内容是 Tavily 的原始 JSON）
-            # 也一起吐出来，直接透传前端会显示一大段 JSON。
-            if not isinstance(chunk, AIMessageChunk):
-                continue
-            # 工具调用那一轮会产出内容为空的 chunk，这里也过滤掉
-            if isinstance(chunk.content, str) and chunk.content:
-                yield chunk.content
+        """按主模型 → 备用模型的顺序尝试；额度用尽/限流/不可用就换下一个。"""
+        last_error: Exception | None = None
+
+        for index, (model_name, agent) in enumerate(candidates):
+            emitted = False
+            try:
+                async for chunk, _meta in agent.astream(
+                    {"messages": [_to_human_message(payload)]},
+                    config,
+                    # 把该用户的称呼和菜品偏好作为运行时上下文传给 agent，
+                    # 由 chef_system_prompt 中间件拼进系统提示词
+                    context={"preferences": preferences},
+                    stream_mode="messages",
+                ):
+                    # 只转发"模型自己生成的文本增量"。
+                    # stream_mode="messages" 会把工具返回（ToolMessage，内容是 Tavily 的原始 JSON）
+                    # 也一起吐出来，直接透传前端会显示一大段 JSON。
+                    if not isinstance(chunk, AIMessageChunk):
+                        continue
+                    # 工具调用那一轮会产出内容为空的 chunk，这里也过滤掉
+                    if isinstance(chunk.content, str) and chunk.content:
+                        emitted = True
+                        yield chunk.content
+
+                if index > 0:
+                    logger.info("本次回复由备用模型 %s 生成", model_name)
+                return
+
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if emitted:
+                    # 已经开始往外吐字了，重试会造成内容重复，只能如实报错
+                    logger.error("模型 %s 输出中断：%s", model_name, exc)
+                    raise
+                if index + 1 >= len(candidates) or not should_fallback(exc):
+                    logger.error("模型 %s 调用失败，且没有可用的备用模型：%s", model_name, exc)
+                    raise
+                logger.warning(
+                    "模型 %s 调用失败（%s），自动切换到 %s",
+                    model_name,
+                    exc,
+                    candidates[index + 1][0],
+                )
+
+        if last_error:
+            raise last_error
 
     # 注意：前端直接读原始响应体，所以吐纯文本，不能加 SSE 的 "data: " 前缀
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
 
 
 @router.get("/chat/messages")
-async def get_chat_messages(thread_id: str, request: Request):
+async def get_chat_messages(
+    thread_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     """读取某个会话的历史消息。"""
+    owner = await _thread_owner(request.app.state.pool, thread_id)
+    if owner is None:
+        return {"messages": []}
+    if owner != user["id"]:
+        raise HTTPException(status_code=403, detail="无权访问该会话")
+
     tup = await request.app.state.checkpointer.aget_tuple(
         {"configurable": {"thread_id": thread_id}}
     )
@@ -73,17 +206,22 @@ async def get_chat_messages(thread_id: str, request: Request):
         # 工具调用结果（Tavily 返回的原始 JSON）不返回给前端
         if m.type == "tool":
             continue
-        text = _content_to_text(m.content)
-        # 只有工具调用、没有正文的消息也跳过
-        if not text:
+        content = _content_to_parts(m.content)
+        # 既没正文、也没图片的消息跳过
+        if not content:
             continue
-        messages.append({"role": ROLE_MAP.get(m.type, m.type), "content": text})
+        if isinstance(content, str) and not content.strip():
+            continue
+        messages.append({"role": ROLE_MAP.get(m.type, m.type), "content": content})
     return {"messages": messages}
 
 
 @router.get("/chat/threads")
-async def list_threads(request: Request):
-    """列出全部历史会话（最近活跃的在前），供前端侧边栏使用。"""
+async def list_threads(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """列出**当前用户**的历史会话（最近活跃的在前），供前端侧边栏使用。"""
     pool = request.app.state.pool
     checkpointer = request.app.state.checkpointer
 
@@ -91,12 +229,15 @@ async def list_threads(request: Request):
     async with pool.connection() as conn:
         cur = await conn.execute(
             """
-            select thread_id, max(checkpoint->>'ts') as last_active
-            from checkpoints
-            group by thread_id
+            select c.thread_id, max(c.checkpoint->>'ts') as last_active
+            from checkpoints c
+            join app_threads t on t.thread_id = c.thread_id
+            where t.user_id = %s
+            group by c.thread_id
             order by last_active desc nulls last
             limit 100
-            """
+            """,
+            (user["id"],),
         )
         rows = await cur.fetchall()
 
@@ -140,7 +281,19 @@ async def list_threads(request: Request):
 
 
 @router.delete("/chat/messages")
-async def clear_chat_messages(thread_id: str, request: Request):
+async def clear_chat_messages(
+    thread_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
     """清空某个会话的历史（checkpoints / blobs / writes 三张表一起删）。"""
+    owner = await _thread_owner(request.app.state.pool, thread_id)
+    if owner is not None and owner != user["id"]:
+        raise HTTPException(status_code=403, detail="无权删除该会话")
+
     await request.app.state.checkpointer.adelete_thread(thread_id)
+    async with request.app.state.pool.connection() as conn:
+        await conn.execute(
+            "delete from app_threads where thread_id = %s", (thread_id,)
+        )
     return {"ok": True}

@@ -19,9 +19,12 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from app.agents.personal_chief import build_agent
+from app.agents.personal_chief import build_agent_pool
 from app.api.v1 import chat
 from app.api.v1 import oss
+from app.api.v1 import auth
+from app.api.v1 import profile
+from app.common.db import init_auth_tables
 from app.common.logger import setup_logging
 
 # 先加载 .env，后面读环境变量才拿得到值
@@ -30,10 +33,13 @@ load_dotenv()
 # 初始化日志配置
 setup_logging()
 
-POSTGRES_URI = os.getenv(
-    "POSTGRES_URI",
-    "postgresql://postgres:880921Lwh@localhost:5432/postgres?sslmode=disable",
-)
+# 数据库连接串只从环境变量读（在 .env 里配），代码里不留密码
+POSTGRES_URI = os.getenv("POSTGRES_URI")
+if not POSTGRES_URI:
+    raise RuntimeError(
+        "缺少数据库连接串：请在 .env 里配置 POSTGRES_URI，例如\n"
+        "POSTGRES_URI=postgresql://用户名:密码@主机:5432/库名?sslmode=disable"
+    )
 
 
 @asynccontextmanager
@@ -48,10 +54,12 @@ async def lifespan(app: FastAPI):
     await pool.open()
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()  # 幂等建表，重复启动也不会出错
+    await init_auth_tables(pool)  # 用户 / 登录令牌 / 会话归属三张表
 
     app.state.pool = pool
     app.state.checkpointer = checkpointer
-    app.state.agent = build_agent(checkpointer)
+    # 按「主模型 → 备用模型」的顺序建好一组 agent，调用时自动降级
+    app.state.agents = build_agent_pool(checkpointer)
     try:
         yield
     finally:
@@ -79,6 +87,8 @@ app.add_middleware(
 # 2.挂载路由
 app.include_router(chat.router, prefix="/api/v1", tags=["对话"])
 app.include_router(oss.router, prefix="/api/v1", tags=["申请上传签名url"])
+app.include_router(auth.router, prefix="/api/v1", tags=["账号"])
+app.include_router(profile.router, prefix="/api/v1", tags=["用户资料"])
 
 # 3.挂载前端资源
 static_dir = os.path.join(os.path.dirname(__file__), "static")
