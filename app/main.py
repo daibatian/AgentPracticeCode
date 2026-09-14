@@ -66,11 +66,20 @@ async def lifespan(app: FastAPI):
         await pool.close()
 
 
+# 接口文档默认关闭：把 /docs /redoc /openapi.json 挂在公网上等于公开接口清单
+# 本地调试需要时，在 .env 里写 DOCS_ENABLED=true
+DOCS_ENABLED = (os.getenv("DOCS_ENABLED") or "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 app = FastAPI(
     title="Personal Chief API",
     description="私厨",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if DOCS_ENABLED else None,
+    redoc_url="/redoc" if DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if DOCS_ENABLED else None,
 )
 
 # 1. 配置跨域资源共享 (CORS)

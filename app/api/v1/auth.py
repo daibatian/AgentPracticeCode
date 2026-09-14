@@ -1,6 +1,7 @@
 """注册 / 登录 / 登出。"""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -13,6 +14,12 @@ router = APIRouter()
 
 # 登录有效期：30 天
 TOKEN_TTL = timedelta(days=30)
+
+# 注册开关：默认开放；线上不想让陌生人注册（注册进来就能刷你的 API 额度），
+# 就在 .env 里写 REGISTRATION_ENABLED=false，已有账号照常登录。
+REGISTRATION_ENABLED = (os.getenv("REGISTRATION_ENABLED") or "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 
 
 def _validate(username: str, password: str) -> tuple[str, str]:
@@ -38,6 +45,10 @@ async def _create_session(pool, user_id: int) -> str:
 
 @router.post("/auth/register", response_model=AuthResponse)
 async def register(payload: RegisterRequest, request: Request):
+    # 关掉注册后只有已有账号能登录，避免陌生人注册进来消耗额度
+    if not REGISTRATION_ENABLED:
+        raise HTTPException(status_code=403, detail="当前已关闭注册")
+
     username, password = _validate(payload.username, payload.password)
     pool = request.app.state.pool
 
