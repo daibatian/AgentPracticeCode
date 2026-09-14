@@ -1,3 +1,4 @@
+import os
 import sys
 from dotenv import load_dotenv
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -9,7 +10,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
-DB_URI = "postgresql://postgres:880921@localhost:5432/postgres?sslmode=disable"
+# 数据库连接串从 .env 读，不要写死在代码里（这里曾经硬编码过明文密码）
+DB_URI = os.getenv("POSTGRES_URI")
+if not DB_URI:
+    raise SystemExit("请在 .env 里配置 POSTGRES_URI")
 with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
     checkpointer.setup() # auto create tables in PostgreSQL
     agent = create_agent(

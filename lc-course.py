@@ -56,7 +56,10 @@ import sys
 # Windows 控制台默认是 GBK 编码，模型回复里带 emoji 时 print 会抛 UnicodeEncodeError
 # sys.stdout.reconfigure(encoding="utf-8")
 
-DB_URI = "postgresql://postgres:880921Lwh@localhost:5432/postgres?sslmode=disable"
+# 数据库连接串从 .env 读，不要写死在代码里（这里曾经硬编码过明文密码）
+DB_URI = os.getenv("POSTGRES_URI")
+if not DB_URI:
+    raise SystemExit("请在 .env 里配置 POSTGRES_URI")
 
 system_prompt = """
 你是一名私人厨师。收到用户提供的食材照片或清单后，请按以下流程操作：
