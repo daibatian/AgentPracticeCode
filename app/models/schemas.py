@@ -44,3 +44,13 @@ class ProfileUpdate(BaseModel):
 class PasswordChange(BaseModel):
     old_password: str
     new_password: str
+
+
+class AdminUserUpdate(BaseModel):
+    """管理端修改用户：权限与额度覆盖，两个字段都可以不传。
+
+    不传 = 不改；`weekly_token_quota` 传 null = 清掉覆盖、恢复用全局默认额度。
+    """
+
+    is_admin: Optional[bool] = None
+    weekly_token_quota: Optional[int] = None

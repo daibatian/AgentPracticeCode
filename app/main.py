@@ -12,7 +12,7 @@ if sys.platform == "win32":
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -23,10 +23,12 @@ from app.agents.personal_chief import build_agent_pool
 from app.api.v1 import chat
 from app.api.v1 import oss
 from app.api.v1 import auth
+from app.api.v1 import admin
 from app.api.v1 import profile
 from app.api.v1 import quota
+from app.common.admin import init_admin_schema, sync_admin_usernames
 from app.common.db import init_auth_tables
-from app.common.logger import setup_logging
+from app.common.logger import logger, setup_logging
 from app.common.quota import (
     RATE_LIMIT_PER_MINUTE,
     SlidingWindowLimiter,
@@ -62,6 +64,10 @@ async def lifespan(app: FastAPI):
     await checkpointer.setup()  # 幂等建表，重复启动也不会出错
     await init_auth_tables(pool)  # 用户 / 登录令牌 / 会话归属三张表
     await init_quota_schema(pool)  # 每周额度：用量表 + 用户额度覆盖列
+    await init_admin_schema(pool)  # 管理员标识列
+    promoted = await sync_admin_usernames(pool)  # .env 里点名的账号补成管理员
+    if promoted:
+        logger.info("按 ADMIN_USERNAMES 设为管理员：%s", "、".join(promoted))
 
     app.state.pool = pool
     app.state.checkpointer = checkpointer
@@ -108,8 +114,20 @@ app.include_router(oss.router, prefix="/api/v1", tags=["申请上传签名url"])
 app.include_router(auth.router, prefix="/api/v1", tags=["账号"])
 app.include_router(profile.router, prefix="/api/v1", tags=["用户资料"])
 app.include_router(quota.router, prefix="/api/v1", tags=["额度"])
+app.include_router(admin.router, prefix="/api/v1", tags=["管理后台"])
 
 # 3.挂载前端资源
+# 管理后台挂在 /admin 下。顺序很重要：必须先注册 /admin，
+# 否则会被下面的 "/" 挂载吃掉（它会匹配所有路径）。
+admin_dir = os.path.join(os.path.dirname(__file__), "static_admin")
+if os.path.exists(admin_dir):
+    app.mount("/admin", StaticFiles(directory=admin_dir, html=True), name="admin")
+
+    # 直接输 /admin（没有结尾斜杠）时挂载点会 404，这里补一个跳转
+    @app.get("/admin", include_in_schema=False)
+    async def admin_redirect():
+        return RedirectResponse(url="/admin/")
+
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
