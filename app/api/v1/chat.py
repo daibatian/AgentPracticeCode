@@ -6,6 +6,7 @@ from app.api.deps import get_current_user
 from app.common.llm import should_fallback
 from app.common.logger import logger
 from app.common.preferences import format_user_context
+from app.common.quota import add_usage, effective_quota, today_usage
 from app.models.schemas import ChatRequest
 
 router = APIRouter()
@@ -121,15 +122,67 @@ async def chat_stream(
     user: dict = Depends(get_current_user),
 ):
     """流式对话：返回纯文本流，前端逐块拼接显示。"""
-    await _ensure_thread_owned(request.app.state.pool, payload.thread_id, user["id"])
-    preferences = await _load_preferences(request.app.state.pool, user["id"])
+    pool = request.app.state.pool
+    await _ensure_thread_owned(pool, payload.thread_id, user["id"])
+
+    # 1) 限流：挡住脚本式的突发请求（按用户计，每分钟 N 次）
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is not None:
+        retry_after = limiter.check(str(user["id"]))
+        if retry_after:
+            limiter.prune()
+            logger.warning("用户 %s 触发限流，%s 秒后可再试", user["id"], retry_after)
+            raise HTTPException(
+                status_code=429,
+                detail=f"请求太频繁了，请 {retry_after} 秒后再试",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    # 2) 每日额度：先看今天已经用掉多少（本轮用量在回复结束后累加）
+    quota = await effective_quota(pool, user["id"])
+    if quota > 0:
+        usage = await today_usage(pool, user["id"])
+        used = int(usage["input_tokens"] or 0) + int(usage["output_tokens"] or 0)
+        if used >= quota:
+            logger.warning("用户 %s 今日额度已用完：%s/%s token", user["id"], used, quota)
+            raise HTTPException(
+                status_code=429,
+                detail=f"今日额度已用完（{used}/{quota} token），明天再来吧",
+            )
+
+    preferences = await _load_preferences(pool, user["id"])
 
     candidates: list = list(getattr(request.app.state, "agents", []) or [])
     if not candidates:
         raise HTTPException(status_code=503, detail="当前没有可用的模型")
     config = {"configurable": {"thread_id": payload.thread_id}}
 
-    async def generate():
+    # 本次请求累计的 token 用量（一次对话可能包含多轮模型调用）
+    usage = {"input": 0, "output": 0}
+    recorded = False
+
+    async def persist_usage() -> None:
+        """把本轮消耗的 token 累加进今天的用量里，一次请求只记一次。
+
+        记在整个请求结束时（正常结束 / 报错 / 客户端断开都会走到），而不是
+        每次模型尝试结束时——降级时失败的那次会把"已记录"提前置上，后面
+        真正成功那次的用量就漏记了。
+        """
+        nonlocal recorded
+        if recorded:
+            return
+        recorded = True
+        try:
+            await add_usage(
+                pool,
+                user["id"],
+                input_tokens=usage["input"],
+                output_tokens=usage["output"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("记录用量失败（不影响本次回复）：%s", exc)
+
+    async def stream_from_models():
         """按主模型 → 备用模型的顺序尝试；额度用尽/限流/不可用就换下一个。"""
         last_error: Exception | None = None
 
@@ -149,6 +202,12 @@ async def chat_stream(
                     # 也一起吐出来，直接透传前端会显示一大段 JSON。
                     if not isinstance(chunk, AIMessageChunk):
                         continue
+                    # 一次对话可能调用多轮模型（工具循环），每轮的用量都要累加；
+                    # 如果发生了降级，失败那轮真实消耗的 token 也会被算进去
+                    meta = getattr(chunk, "usage_metadata", None)
+                    if meta:
+                        usage["input"] += meta.get("input_tokens") or 0
+                        usage["output"] += meta.get("output_tokens") or 0
                     # 工具调用那一轮会产出内容为空的 chunk，这里也过滤掉
                     if isinstance(chunk.content, str) and chunk.content:
                         emitted = True
@@ -173,9 +232,17 @@ async def chat_stream(
                     exc,
                     candidates[index + 1][0],
                 )
-
         if last_error:
             raise last_error
+
+    async def generate():
+        """透传模型输出，并在请求真正结束时记录用量。"""
+        try:
+            async for piece in stream_from_models():
+                yield piece
+        finally:
+            # 正常结束、报错、客户端中途断开都会走到这里
+            await persist_usage()
 
     # 注意：前端直接读原始响应体，所以吐纯文本，不能加 SSE 的 "data: " 前缀
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")

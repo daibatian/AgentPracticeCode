@@ -24,8 +24,14 @@ from app.api.v1 import chat
 from app.api.v1 import oss
 from app.api.v1 import auth
 from app.api.v1 import profile
+from app.api.v1 import quota
 from app.common.db import init_auth_tables
 from app.common.logger import setup_logging
+from app.common.quota import (
+    RATE_LIMIT_PER_MINUTE,
+    SlidingWindowLimiter,
+    init_quota_schema,
+)
 
 # 先加载 .env，后面读环境变量才拿得到值
 load_dotenv()
@@ -55,11 +61,14 @@ async def lifespan(app: FastAPI):
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()  # 幂等建表，重复启动也不会出错
     await init_auth_tables(pool)  # 用户 / 登录令牌 / 会话归属三张表
+    await init_quota_schema(pool)  # 每日用量表 + 用户额度覆盖列
 
     app.state.pool = pool
     app.state.checkpointer = checkpointer
     # 按「主模型 → 备用模型」的顺序建好一组 agent，调用时自动降级
     app.state.agents = build_agent_pool(checkpointer)
+    # 每用户每分钟的对话次数限流（内存滑动窗口，单进程内有效）
+    app.state.rate_limiter = SlidingWindowLimiter(RATE_LIMIT_PER_MINUTE)
     try:
         yield
     finally:
@@ -98,6 +107,7 @@ app.include_router(chat.router, prefix="/api/v1", tags=["对话"])
 app.include_router(oss.router, prefix="/api/v1", tags=["申请上传签名url"])
 app.include_router(auth.router, prefix="/api/v1", tags=["账号"])
 app.include_router(profile.router, prefix="/api/v1", tags=["用户资料"])
+app.include_router(quota.router, prefix="/api/v1", tags=["额度"])
 
 # 3.挂载前端资源
 static_dir = os.path.join(os.path.dirname(__file__), "static")
