@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()  # 幂等建表，重复启动也不会出错
     await init_auth_tables(pool)  # 用户 / 登录令牌 / 会话归属三张表
-    await init_quota_schema(pool)  # 每日用量表 + 用户额度覆盖列
+    await init_quota_schema(pool)  # 每周额度：用量表 + 用户额度覆盖列
 
     app.state.pool = pool
     app.state.checkpointer = checkpointer

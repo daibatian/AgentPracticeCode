@@ -15,7 +15,7 @@
 - **联网检索**：接入 Tavily 联网搜索，工具结果做结构化压缩后再进上下文。
 - **上下文治理**：历史 token 超过阈值自动摘要，只保留最近若干轮，兼顾成本与连贯性。
 - **模型高可用**：主模型 + 备用模型链全部配置化，额度耗尽 / 限流 / 模型不可用时自动降级。
-- **额度与限流**：每用户每日 token 额度 + 每分钟请求次数限流，防止公开服务被刷额度。
+- **额度与限流**：每用户每周 100 万 token 额度（每周一 0 点重置）+ 每分钟请求次数限流，防止公开服务被刷额度。
 - **历史回放**：侧边栏按最后活跃时间列出会话，可随时回看、切换、删除。
 
 ## 技术栈
@@ -69,11 +69,11 @@ PostgreSQL
 │   │       ├── chat.py            流式对话（模型降级循环）、历史消息、会话列表
 │   │       ├── auth.py            注册 / 登录 / 登出 / me
 │   │       ├── profile.py         资料与口味偏好、修改密码
-│   │       ├── quota.py           今日额度与用量查询
+│   │       ├── quota.py           本周额度与用量查询
 │   │       └── oss.py             OSS 预签名 URL
 │   ├── common/
 │   │   ├── db.py                  业务表建表与平滑迁移（add column if not exists）
-│   │   ├── quota.py               每日额度、限流器、用量累加（含 app_usage_daily 建表）
+│   │   ├── quota.py               每周额度、限流器、用量累加（含 app_usage_daily 建表）
 │   │   ├── llm.py                 模型清单与「该不该降级」的判断
 │   │   ├── preferences.py         口味偏好 → 提示词文本
 │   │   ├── security.py            PBKDF2 密码哈希、会话令牌
@@ -155,9 +155,9 @@ cp -r dist/* <后端目录>/app/static/
 | `OSS_BUCKET` / `OSS_ENDPOINT` | OSS 桶名与地域域名 | `my-bucket` / `oss-cn-beijing.aliyuncs.com` |
 | `REGISTRATION_ENABLED` | 注册开关，`false` 时只有已有账号能登录 | `false` |
 | `DOCS_ENABLED` | 是否开放 `/docs`、`/redoc`、`/openapi.json` | `false` |
-| `DEFAULT_DAILY_TOKEN_QUOTA` | 新用户的默认每日 token 额度（0 = 不限） | `100000` |
+| `DEFAULT_WEEKLY_TOKEN_QUOTA` | 新用户的默认每周 token 额度（0 = 不限） | `1000000` |
 | `RATE_LIMIT_PER_MINUTE` | 每个用户每分钟最多发起几次对话（0 = 不限） | `6` |
-| `QUOTA_TIMEZONE` | 额度按哪个时区的自然日重置 | `Asia/Shanghai` |
+| `QUOTA_TIMEZONE` | 额度按哪个时区的自然周重置（周一 0 点） | `Asia/Shanghai` |
 | `LANGSMITH_API_KEY` / `LANGSMITH_TRACING` / `LANGSMITH_PROJECT` | 可选的链路追踪 | `false` |
 | `HOST` / `PORT` | 监听地址与端口 | `127.0.0.1` / `8001` |
 
@@ -180,7 +180,7 @@ cp -r dist/* <后端目录>/app/static/
 | GET | `/profile` | 读取资料与口味偏好 | 是 |
 | PUT | `/profile` | 更新资料与口味偏好（只更新传入字段） | 是 |
 | POST | `/profile/password` | 修改密码 | 是 |
-| GET | `/quota` | 今日额度与用量（额度、已用、剩余、请求数） | 是 |
+| GET | `/quota` | 本周额度与用量（额度、已用、剩余、请求数、下次重置时间） | 是 |
 | GET | `/oss/presign` | 获取图片上传的预签名 URL | 是 |
 
 ## 关键设计
@@ -215,8 +215,9 @@ cp -r dist/* <后端目录>/app/static/
 ### 7. 配额与限流
 
 - **额度按 token 计**，不按对话次数：实测一次文字提问约 3.6k token、一次图片提问约 22k token，按次数限制会差 6 倍。
-- **每日重置、时区可配**：服务器时区通常是 UTC，不配 `QUOTA_TIMEZONE` 会在北京时间早上 8 点重置。
-- **默认额度全局配置 + 按用户覆盖**：`DEFAULT_DAILY_TOKEN_QUOTA` 决定所有新用户的额度，不必逐个分配；要给某个用户单独加量时，写 `app_users.daily_token_quota` 即可（NULL = 用全局默认）。
+- **按自然周重置（周一 0 点）、时区可配**：服务器时区通常是 UTC，不配 `QUOTA_TIMEZONE` 会把重置时刻挪到北京时间周二早上 8 点。
+- **用量按天存、按周汇总**：`app_usage_daily` 每天一行（后台看趋势），配额判断时求和本周的行——既能按周限额，又不丢日粒度。
+- **默认额度全局配置 + 按用户覆盖**：`DEFAULT_WEEKLY_TOKEN_QUOTA` 决定所有新用户的额度，不必逐个分配；要给某个用户单独加量时，写 `app_users.weekly_token_quota` 即可（NULL = 用全局默认）。
 - **限流是单进程内存滑动窗口**，主要挡脚本式的突发请求；多实例部署时每个实例各限一份，要全局精确需换成 Redis 之类的共享计数。
 - 用量在**整个请求结束时**统一落库（正常结束 / 报错 / 客户端中途断开都会记），避免"断开就不计费"被绕过。
 
@@ -257,7 +258,7 @@ systemctl status chef --no-pager
 - 会话、消息、资料接口均校验归属，越权返回 403。
 - 图片上传需登录，对象名服务端生成、扩展名白名单校验。
 - 接口文档默认关闭（`DOCS_ENABLED`）；注册可一键关闭（`REGISTRATION_ENABLED`）。
-- 每用户每日 token 额度 + 每分钟请求数限流，额度可在 `app_users.daily_token_quota` 按用户覆盖。
+- 每用户每周 token 额度 + 每分钟请求数限流，额度可在 `app_users.weekly_token_quota` 按用户覆盖。
 - 数据库连接串只从环境变量读取，代码与仓库中不含明文凭据。
 
 部署到公网前建议补充：
@@ -265,11 +266,11 @@ systemctl status chef --no-pager
 - 收紧 CORS（当前为 `allow_origins=["*"]`），改为具体域名；
 - 配置域名 + HTTPS（国内服务器需先完成 ICP 备案）；
 - 定期轮换密钥，数据库与 OSS 使用独立的最小权限账号；
-- 把 `DEFAULT_DAILY_TOKEN_QUOTA` 调成符合自己成本预算的值（示例值 10 万 token/天）。
+- 把 `DEFAULT_WEEKLY_TOKEN_QUOTA` 调成符合自己成本预算的值（示例值 100 万 token/周）。
 
 ## Roadmap
 
-- [x] 每用户每日配额与限流（防止公开服务被刷额度）
+- [x] 每用户每周配额与限流（防止公开服务被刷额度）
 - [ ] 管理后台：用户 / 会话 / 模型配置 / 用量与审计
 - [ ] 会话重命名、置顶、搜索；回复点赞点踩反馈闭环
 - [ ] 域名 + HTTPS + 监控告警

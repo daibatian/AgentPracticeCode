@@ -6,7 +6,7 @@ from app.api.deps import get_current_user
 from app.common.llm import should_fallback
 from app.common.logger import logger
 from app.common.preferences import format_user_context
-from app.common.quota import add_usage, effective_quota, today_usage
+from app.common.quota import add_usage, effective_quota, week_usage
 from app.models.schemas import ChatRequest
 
 router = APIRouter()
@@ -138,16 +138,16 @@ async def chat_stream(
                 headers={"Retry-After": str(retry_after)},
             )
 
-    # 2) 每日额度：先看今天已经用掉多少（本轮用量在回复结束后累加）
+    # 2) 每周额度：先看本周已经用掉多少（本轮用量在回复结束后累加）
     quota = await effective_quota(pool, user["id"])
     if quota > 0:
-        usage = await today_usage(pool, user["id"])
+        usage = await week_usage(pool, user["id"])
         used = int(usage["input_tokens"] or 0) + int(usage["output_tokens"] or 0)
         if used >= quota:
-            logger.warning("用户 %s 今日额度已用完：%s/%s token", user["id"], used, quota)
+            logger.warning("用户 %s 本周额度已用完：%s/%s token", user["id"], used, quota)
             raise HTTPException(
                 status_code=429,
-                detail=f"今日额度已用完（{used}/{quota} token），明天再来吧",
+                detail=f"本周额度已用完（{used}/{quota} token），下周一重置",
             )
 
     preferences = await _load_preferences(pool, user["id"])
