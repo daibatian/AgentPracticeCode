@@ -4,8 +4,16 @@
  *
  * 具体页面放在 views/ 下（用户管理、操作日志），加新板块只要往导航里加一项。
  */
-import { onMounted, ref } from "vue";
-import { History, LogOut, ShieldAlert, ShieldCheck, Users } from "@lucide/vue";
+import { computed, onMounted, ref } from "vue";
+import {
+  ChevronLeft,
+  ChevronRight,
+  History,
+  LogOut,
+  ShieldAlert,
+  ShieldCheck,
+  Users,
+} from "@lucide/vue";
 
 import LoginView from "./components/LoginView.vue";
 import {
@@ -18,6 +26,7 @@ import {
 } from "./lib/api";
 import LogsView from "./views/LogsView.vue";
 import UsersView from "./views/UsersView.vue";
+import { loadNumber, saveValue } from "./lib/resize";
 
 type Phase = "booting" | "login" | "forbidden" | "ready";
 type Tab = "users" | "logs";
@@ -31,6 +40,19 @@ const TABS = [
 const phase = ref<Phase>("booting");
 const tab = ref<Tab>("users");
 const adminName = ref(getAdminName());
+
+// 侧边栏收起状态记在本地，收起时只留图标（用 title 提示）
+const SIDEBAR_KEY = "chef_admin_sidebar_collapsed_v1";
+const collapsed = ref(loadNumber(SIDEBAR_KEY) === 1);
+const sidebarWidth = computed(() => (collapsed.value ? 64 : 208));
+const currentTabLabel = computed(
+  () => TABS.find((item) => item.key === tab.value)?.label ?? "",
+);
+
+function toggleSidebar() {
+  collapsed.value = !collapsed.value;
+  saveValue(SIDEBAR_KEY, collapsed.value ? 1 : 0);
+}
 
 interface Toast {
   id: number;
@@ -125,55 +147,113 @@ function logout() {
     </div>
   </div>
 
-  <div v-else class="h-full flex flex-col bg-slate-100">
-    <!-- 顶栏：标题 + 导航 -->
-    <header class="shrink-0 bg-white border-b border-slate-200">
-      <div class="px-5 py-3 flex items-center gap-3">
-        <div class="p-1.5 rounded-lg bg-slate-900 text-white">
+  <div v-else class="h-full flex bg-slate-100">
+    <!-- 左侧菜单栏（可收起） -->
+    <aside
+      class="shrink-0 bg-white border-r border-slate-200 flex flex-col overflow-hidden transition-[width] duration-200"
+      :style="{ width: `${sidebarWidth}px` }"
+    >
+      <div class="h-14 shrink-0 flex items-center gap-2 px-4 border-b border-slate-200">
+        <div class="p-1.5 rounded-lg bg-slate-900 text-white shrink-0">
           <ShieldCheck :size="18" />
         </div>
-        <div class="min-w-0">
-          <h1 class="text-sm font-semibold text-slate-800">AI 私厨 · 管理后台</h1>
-          <p class="text-[11px] text-slate-400">管理端</p>
-        </div>
-
-        <nav class="flex items-center gap-1 ml-3 bg-slate-100 rounded-xl p-1">
-          <button
-            v-for="item in TABS"
-            :key="item.key"
-            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm transition-colors"
-            :class="
-              tab === item.key
-                ? 'bg-white text-slate-800 font-medium shadow-sm'
-                : 'text-slate-500 hover:text-slate-700'
-            "
-            @click="tab = item.key"
-          >
-            <component :is="item.icon" :size="14" />
-            <span>{{ item.label }}</span>
-          </button>
-        </nav>
-
-        <span class="ml-auto text-xs text-slate-500 hidden sm:inline">
-          管理员：<span class="font-medium text-slate-700">{{ adminName }}</span>
+        <span
+          v-if="!collapsed"
+          class="text-sm font-semibold text-slate-800 whitespace-nowrap"
+        >
+          AI 私厨 · 后台
         </span>
         <button
-          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-slate-500 hover:text-red-500 hover:bg-red-50 transition"
-          @click="logout"
+          v-if="!collapsed"
+          class="ml-auto p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+          title="收起侧边栏"
+          @click="toggleSidebar"
         >
-          <LogOut :size="14" />
-          <span>退出</span>
+          <ChevronLeft :size="16" />
         </button>
       </div>
-    </header>
 
-    <UsersView
-      v-if="tab === 'users'"
-      :admin-name="adminName"
-      @notify="pushToast"
-      @auth-expired="logout"
-    />
-    <LogsView v-else @notify="pushToast" @auth-expired="logout" />
+      <!-- 菜单 -->
+      <nav class="flex-1 p-2 space-y-1">
+        <button
+          v-for="item in TABS"
+          :key="item.key"
+          class="w-full flex items-center gap-2.5 py-2.5 rounded-xl text-sm transition-colors"
+          :class="[
+            tab === item.key
+              ? 'bg-slate-900 text-white font-medium'
+              : 'text-slate-600 hover:bg-slate-100',
+            collapsed ? 'justify-center px-0' : 'px-3',
+          ]"
+          :title="collapsed ? item.label : undefined"
+          @click="tab = item.key"
+        >
+          <component :is="item.icon" :size="17" class="shrink-0" />
+          <span v-if="!collapsed" class="whitespace-nowrap">{{ item.label }}</span>
+        </button>
+      </nav>
+
+      <!-- 底部：收起时是展开按钮，展开时是账号信息 -->
+      <div class="shrink-0 border-t border-slate-200 p-2">
+        <button
+          v-if="collapsed"
+          class="w-full flex items-center justify-center py-2.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+          title="展开侧边栏"
+          @click="toggleSidebar"
+        >
+          <ChevronRight :size="18" />
+        </button>
+
+        <div v-else class="flex items-center gap-2 px-1.5 py-1.5">
+          <div
+            class="w-7 h-7 rounded-full bg-slate-800 text-white text-xs flex items-center justify-center shrink-0"
+          >
+            {{ (adminName || "?").slice(0, 1).toUpperCase() }}
+          </div>
+          <div class="flex-1 min-w-0">
+            <p class="text-xs font-medium text-slate-700 truncate">
+              {{ adminName || "未登录" }}
+            </p>
+            <p class="text-[10px] text-slate-400">管理员</p>
+          </div>
+          <button
+            class="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 transition shrink-0"
+            title="退出登录"
+            @click="logout"
+          >
+            <LogOut :size="15" />
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 右侧内容区 -->
+    <main class="flex-1 min-w-0 flex flex-col">
+      <header
+        class="h-14 shrink-0 bg-white border-b border-slate-200 flex items-center gap-3 px-5"
+      >
+        <button
+          v-if="collapsed"
+          class="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+          title="展开侧边栏"
+          @click="toggleSidebar"
+        >
+          <ChevronRight :size="18" />
+        </button>
+        <h1 class="text-sm font-semibold text-slate-800">{{ currentTabLabel }}</h1>
+        <span class="ml-auto text-xs text-slate-400 hidden sm:inline">
+          AI 私厨 · 管理后台
+        </span>
+      </header>
+
+      <UsersView
+        v-if="tab === 'users'"
+        :admin-name="adminName"
+        @notify="pushToast"
+        @auth-expired="logout"
+      />
+      <LogsView v-else @notify="pushToast" @auth-expired="logout" />
+    </main>
 
     <!-- 全局操作提示 -->
     <div class="fixed top-4 right-4 z-[60] w-80 space-y-2">
