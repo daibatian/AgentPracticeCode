@@ -13,7 +13,7 @@ import secrets
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.deps import get_current_user
-from app.common.admin import count_admins, is_admin_user
+from app.common.admin import count_admins, is_admin_user, record_admin_action
 from app.common.quota import QUOTA_TIMEZONE, resolve_quota, week_usage
 from app.common.security import hash_password
 from app.models.schemas import AdminUserUpdate
@@ -34,6 +34,31 @@ async def require_admin(request: Request, user: dict = Depends(get_current_user)
     if not await is_admin_user(request.app.state.pool, user["id"]):
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user
+
+
+async def _log(
+    request: Request,
+    admin: dict,
+    action: str,
+    *,
+    target: dict | None = None,
+    detail: dict | None = None,
+    result: str = "ok",
+    message: str | None = None,
+) -> None:
+    """写一条审计日志。被拒绝的尝试也记（result="denied"），这样"谁想干什么"也留痕。"""
+    await record_admin_action(
+        request.app.state.pool,
+        admin_id=admin["id"],
+        admin_username=admin["username"],
+        action=action,
+        target_user_id=(target or {}).get("id"),
+        target_username=(target or {}).get("username"),
+        detail=detail,
+        result=result,
+        message=message,
+        ip=request.client.host if request.client else None,
+    )
 
 
 # 列表与详情共用的列（刻意不查 password_hash）
@@ -214,8 +239,18 @@ async def update_user(
         value = bool(data["is_admin"])
         if not value:
             if user_id == admin["id"]:
+                await _log(
+                    request, admin, "update_user", target=target,
+                    detail={"is_admin": False},
+                    result="denied", message="不能取消自己的管理员权限",
+                )
                 raise HTTPException(status_code=400, detail="不能取消自己的管理员权限")
             if target["is_admin"] and await count_admins(pool) <= 1:
+                await _log(
+                    request, admin, "update_user", target=target,
+                    detail={"is_admin": False},
+                    result="denied", message="至少要保留一个管理员",
+                )
                 raise HTTPException(status_code=400, detail="至少要保留一个管理员")
         updates["is_admin"] = value
 
@@ -225,6 +260,11 @@ async def update_user(
             updates["weekly_token_quota"] = None
         else:
             if raw < 0:
+                await _log(
+                    request, admin, "update_user", target=target,
+                    detail={"weekly_token_quota": raw},
+                    result="denied", message="额度不能是负数",
+                )
                 raise HTTPException(status_code=400, detail="额度不能是负数")
             updates["weekly_token_quota"] = int(raw)
 
@@ -239,6 +279,7 @@ async def update_user(
         )
 
     updated = await _fetch_user(pool, user_id)
+    await _log(request, admin, "update_user", target=updated, detail=updates)
     return _serialize_user(updated)
 
 
@@ -249,17 +290,26 @@ async def logout_all(user_id: int, request: Request, admin: dict = Depends(requi
     不允许对自己执行：那等于把自己踢出去，想退出请用右上角的退出。
     """
     if user_id == admin["id"]:
+        await _log(
+            request, admin, "logout_all", target={"id": user_id, "username": None},
+            result="denied", message="不能对自己强制下线",
+        )
         raise HTTPException(
             status_code=400, detail="不能对自己强制下线，要退出请点右上角的「退出」"
         )
     pool = request.app.state.pool
-    if await _fetch_user(pool, user_id) is None:
+    target = await _fetch_user(pool, user_id)
+    if target is None:
         raise HTTPException(status_code=404, detail="用户不存在")
     async with pool.connection() as conn:
         cur = await conn.execute(
             "delete from app_sessions where user_id = %s", (user_id,)
         )
         removed = cur.rowcount
+    await _log(
+        request, admin, "logout_all", target=target,
+        detail={"removed_sessions": removed},
+    )
     return {"removed_sessions": removed}
 
 
@@ -272,6 +322,10 @@ async def reset_password(user_id: int, request: Request, admin: dict = Depends(r
     要改自己的密码，用客户端个人中心里的「修改密码」。
     """
     if user_id == admin["id"]:
+        await _log(
+            request, admin, "reset_password", target={"id": user_id, "username": admin["username"]},
+            result="denied", message="不能重置自己的密码",
+        )
         raise HTTPException(
             status_code=400,
             detail="不能在这里重置自己的密码，请在客户端个人中心里修改",
@@ -287,7 +341,13 @@ async def reset_password(user_id: int, request: Request, admin: dict = Depends(r
             "update app_users set password_hash = %s where id = %s",
             (hash_password(password), user_id),
         )
-        await conn.execute("delete from app_sessions where user_id = %s", (user_id,))
+        cur = await conn.execute("delete from app_sessions where user_id = %s", (user_id,))
+        cleared = cur.rowcount
+    # 只记"清掉了几个登录态"，临时密码本身绝不入库
+    await _log(
+        request, admin, "reset_password", target=target,
+        detail={"cleared_sessions": cleared},
+    )
     return {"username": target["username"], "password": password}
 
 
@@ -296,12 +356,20 @@ async def delete_user(user_id: int, request: Request, admin: dict = Depends(requ
     """删除用户：连带删掉他的会话、对话状态、登录令牌和用量记录。"""
     pool = request.app.state.pool
     if user_id == admin["id"]:
+        await _log(
+            request, admin, "delete_user", target={"id": user_id, "username": admin["username"]},
+            result="denied", message="不能删除自己的账号",
+        )
         raise HTTPException(status_code=400, detail="不能删除自己的账号")
 
     target = await _fetch_user(pool, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="用户不存在")
     if target["is_admin"] and await count_admins(pool) <= 1:
+        await _log(
+            request, admin, "delete_user", target=target,
+            result="denied", message="至少要保留一个管理员",
+        )
         raise HTTPException(status_code=400, detail="至少要保留一个管理员")
 
     async with pool.connection() as conn:
@@ -319,4 +387,70 @@ async def delete_user(user_id: int, request: Request, admin: dict = Depends(requ
         # app_sessions / app_threads / app_usage_daily 都是 on delete cascade
         await conn.execute("delete from app_users where id = %s", (user_id,))
 
+    await _log(
+        request, admin, "delete_user", target=target,
+        detail={"threads": len(thread_ids)},
+    )
     return {"deleted": {"user_id": user_id, "username": target["username"], "threads": len(thread_ids)}}
+
+
+@router.get("/admin/logs")
+async def list_logs(
+    request: Request,
+    admin: dict = Depends(require_admin),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=100),
+    action: str | None = Query(default=None, description="按操作类型过滤"),
+    result: str | None = Query(default=None, description="ok / denied"),
+    admin_username: str | None = Query(default=None, description="按操作人过滤"),
+    target_user_id: int | None = Query(default=None, description="按被操作用户过滤"),
+):
+    """管理操作日志：谁、什么时候、对谁、做了什么、结果如何。"""
+    pool = request.app.state.pool
+
+    clauses: list[str] = []
+    params: dict = {}
+    if action:
+        clauses.append("action = %(action)s")
+        params["action"] = action
+    if result:
+        clauses.append("result = %(result)s")
+        params["result"] = result
+    if admin_username:
+        clauses.append("admin_username = %(admin_username)s")
+        params["admin_username"] = admin_username
+    if target_user_id is not None:
+        clauses.append("target_user_id = %(target_user_id)s")
+        params["target_user_id"] = target_user_id
+    where = f"where {' and '.join(clauses)}" if clauses else ""
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(f"select count(*) as total from app_admin_logs {where}", params)
+        total = (await cur.fetchone())["total"]
+
+        cur = await conn.execute(
+            f"""
+            select id, created_at, admin_id, admin_username,
+                   target_user_id, target_username,
+                   action, detail, result, message, ip
+            from app_admin_logs
+            {where}
+            order by id desc
+            limit %(limit)s offset %(offset)s
+            """,
+            {**params, "limit": size, "offset": (page - 1) * size},
+        )
+        rows = await cur.fetchall()
+
+    return {
+        "total": total,
+        "page": page,
+        "size": size,
+        "items": [
+            {
+                **row,
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in rows
+        ],
+    }

@@ -4,7 +4,7 @@
  * 登录用的是同一套 /api/v1/auth/login，但令牌单独存一个 key：
  * 这样在同一个浏览器里，管理端和用户端不会互相把对方挤下线。
  */
-import type { UserDetail, UserPage } from "../types";
+import type { LogPage, UserDetail, UserPage } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 
@@ -124,4 +124,21 @@ export function deleteUser(userId: number) {
     `/api/v1/admin/users/${userId}`,
     { method: "DELETE" },
   );
+}
+
+/* ---------------- 审计日志 ---------------- */
+
+export function fetchLogs(params: {
+  page: number;
+  size: number;
+  action?: string;
+  result?: string;
+}) {
+  const search = new URLSearchParams({
+    page: String(params.page),
+    size: String(params.size),
+  });
+  if (params.action) search.set("action", params.action);
+  if (params.result) search.set("result", params.result);
+  return request<LogPage>(`/api/v1/admin/logs?${search.toString()}`);
 }

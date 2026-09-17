@@ -35,3 +35,26 @@ export interface UserDetail extends AdminUserRow {
     notes: string;
   };
 }
+
+/** 一条管理操作日志 */
+export interface AdminLogRow {
+  id: number;
+  created_at: string | null;
+  admin_id: number | null;
+  admin_username: string;
+  target_user_id: number | null;
+  target_username: string | null;
+  action: string;
+  detail: Record<string, unknown> | null;
+  /** ok / denied */
+  result: string;
+  message: string | null;
+  ip: string | null;
+}
+
+export interface LogPage {
+  total: number;
+  page: number;
+  size: number;
+  items: AdminLogRow[];
+}

@@ -7,10 +7,33 @@ from __future__ import annotations
 
 import os
 
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
+
+from app.common.logger import logger
 
 ADMIN_SQL = [
     "alter table app_users add column if not exists is_admin boolean not null default false",
+    # 管理操作审计日志。
+    # 管理员/对象的名字额外存一份快照：账号被删掉之后，日志仍然看得懂是谁对谁做的。
+    """
+    create table if not exists app_admin_logs (
+        id              bigserial primary key,
+        created_at      timestamptz not null default now(),
+        admin_id        bigint references app_users(id) on delete set null,
+        admin_username  text not null,
+        target_user_id  bigint references app_users(id) on delete set null,
+        target_username text,
+        action          text not null,
+        detail          jsonb,
+        result          text not null default 'ok',
+        message         text,
+        ip              text
+    )
+    """,
+    "create index if not exists app_admin_logs_created_idx on app_admin_logs(created_at desc)",
+    "create index if not exists app_admin_logs_admin_idx on app_admin_logs(admin_id)",
+    "create index if not exists app_admin_logs_target_idx on app_admin_logs(target_user_id)",
 ]
 
 
@@ -68,3 +91,46 @@ async def count_admins(pool: AsyncConnectionPool) -> int:
     async with pool.connection() as conn:
         cur = await conn.execute("select count(*) as c from app_users where is_admin")
         return (await cur.fetchone())["c"]
+
+
+async def record_admin_action(
+    pool: AsyncConnectionPool,
+    *,
+    admin_id: int,
+    admin_username: str,
+    action: str,
+    target_user_id: int | None = None,
+    target_username: str | None = None,
+    detail: dict | None = None,
+    result: str = "ok",
+    message: str | None = None,
+    ip: str | None = None,
+) -> None:
+    """记一条管理操作日志。
+
+    刻意"尽力而为"：日志写失败只在服务端告警，绝不因为它把主操作也搞挂。
+    也刻意不记敏感内容（比如新密码）——detail 里只放变更字段和数量。
+    """
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                insert into app_admin_logs
+                    (admin_id, admin_username, target_user_id, target_username,
+                     action, detail, result, message, ip)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    admin_id,
+                    admin_username,
+                    target_user_id,
+                    target_username,
+                    action,
+                    Jsonb(detail) if detail is not None else None,
+                    result,
+                    message,
+                    ip,
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("写管理操作日志失败（不影响主流程）：%s", exc)
